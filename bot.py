@@ -17,13 +17,13 @@ CONFIG = {
     "PROXY": "0x658293eF9454A2DD555eb4afcE6436aDE78ab20B",
     
     # 🔽 AJUSTE SÓ ESSES 3 VALORES 🔽
-    "PRECO_MAXIMO": 0.99,      # Ex: 0.40 = R$ 0,40
-    "PRECO_MINIMO": 0.61,      # Ex: 0.20 = R$ 0,20
+    "PRECO_MAXIMO": 0.77,      # Ex: 0.40 = R$ 0,40
+    "PRECO_MINIMO": 0.48,      # Ex: 0.20 = R$ 0,20
     "INTERVALO_PRECO": 0.01,   # Espaço entre preços (0.01 = 1 centavo)
     
     # 🔽 CONFIGURAÇÕES PADRÃO 🔽
     "SHARES_POR_ORDEM": 5,     # Quantidade por ordem
-    "INTERVALO_TEMPO": 10,     # Tempo entre ciclos (segundos)
+    "INTERVALO_TEMPO": 5,     # Tempo entre ciclos (segundos)
 }
 # ============================================================================
 
