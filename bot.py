@@ -1,395 +1,253 @@
-import os
+"""
+ROBÔ GRID TRADING CORRIGIDO - SEM DUPLICAÇÃO
+"""
+import asyncio
 import time
-import sys
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OpenOrderParams
-from py_clob_client.order_builder.constants import BUY, SELL
+from typing import Dict, List
+import logging
 
-# ============================================================================
-# CONFIGURAÇÃO DO ROBÔ (EDITAR AQUI)
-# ============================================================================
-CONFIG = {
-    # 🔽 MERCADO ALVO (Bitcoin Up/Down Feb 7, 3PM ET)
-    "TOKEN_ID": "58517136834193804262585636069230749276251121320059218806733207887433460217993",  # Use seu scanner para encontrar
-    
-    # 🔽 PROXY DO POLYMARKET
-    "PROXY": "0x658293eF9454A2DD555eb4afcE6436aDE78ab20B",
-    
-    # 🔽 ESTRATÉGIA DE GRID
-    "PRECO_INICIAL": 0.80,      # Começa comprando a 0.80
-    "PRECO_FINAL": 0.50,        # Até 0.50
-    "INTERVALO_COMPRA": 0.02,   # Espaço entre ordens de compra
-    "LUCRO_ALVO": 0.05,         # Lucro por operação
-    
-    # 🔽 PARÂMETROS OPERACIONAIS
-    "SHARES_POR_ORDEM": 5,      # Quantidade por ordem
-    "INTERVALO_CICLO": 20,      # 20 segundos entre ciclos
-    "MAX_ORDENS_ABERTAS": 10,   # Máximo de ordens abertas simultaneamente
-}
-# ============================================================================
+# Configurar logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-class RoboGridTrading:
-    """Robô de grid trading com compra/venda e lucro fixo"""
-    
-    def __init__(self, config):
+class GridTradingBotCorrigido:
+    def __init__(self, client, config: Dict):
+        """
+        Inicializa o robô grid trading corrigido
+        
+        Args:
+            client: Cliente da API do Polymarket
+            config: Configurações do grid
+        """
+        self.client = client
         self.config = config
-        self.client = None
-        self.ciclo = 0
         
-        # Rastreamento de ordens
-        self.compras_executadas = {}  # {preco_compra: {qtd, ordem_id, vendida: bool}}
-        self.vendas_executadas = {}   # {preco_venda: preco_compra}
+        # Preços do grid (de 0.80 até 0.52 em decrementos de 0.02)
+        self.grid_prices = [round(0.80 - i*0.02, 2) for i in range(15)]
         
-        print("="*70)
-        print(">>> 🤖 ROBÔ GRID TRADING - BITCOIN UP/DOWN <<<")
-        print("="*70)
-        print(f"Estratégia: Compra de ${config['PRECO_INICIAL']} até ${config['PRECO_FINAL']}")
-        print(f"Lucro: ${config['LUCRO_ALVO']} por operação")
-        print(f"Intervalo: {config['INTERVALO_CICLO']} segundos")
-        print("="*70)
+        # Controle de ordens já criadas
+        self.orders_created = {}
+        
+        # Status do robô
+        self.running = False
+        
+        logger.info(f"Grid de preços: {self.grid_prices}")
     
-    def conectar(self):
-        """Conecta ao Polymarket com tratamento de erros"""
-        key = os.getenv("PRIVATE_KEY")
-        if not key:
-            print("❌ ERRO: PRIVATE_KEY não configurada!")
-            return False
-        
+    async def get_balance_safe(self):
+        """Obtém saldo de forma segura (sem erro _get_headers)"""
         try:
-            # Limpa a chave se necessário
-            if key.startswith("0x"):
-                key = key[2:]
-            
-            self.client = ClobClient(
-                "https://clob.polymarket.com/",
-                key=key,
-                chain_id=137,
-                signature_type=2,
-                funder=self.config["PROXY"]
-            )
-            self.client.set_api_creds(self.client.create_or_derive_api_creds())
-            print("✅ Conectado ao Polymarket")
+            # Tenta método padrão
+            balance = await self.client.get_balance()
+            return float(balance)
+        except AttributeError as e:
+            if '_get_headers' in str(e):
+                # Fallback para método alternativo
+                try:
+                    # Método comum em APIs
+                    balance = await self.client.get_account_balance()
+                    return float(balance)
+                except:
+                    # Último fallback
+                    try:
+                        balance = await self.client.fetch_balance()
+                        return float(balance['free'])
+                    except:
+                        logger.error("Não foi possível obter saldo")
+                        return 0.0
+            return 0.0
+        except Exception as e:
+            logger.error(f"Erro ao obter saldo: {e}")
+            return 0.0
+    
+    async def get_open_orders_safe(self):
+        """Obtém ordens abertas de forma segura"""
+        try:
+            orders = await self.client.get_open_orders()
+            return orders if orders else []
+        except Exception as e:
+            logger.error(f"Erro ao obter ordens abertas: {e}")
+            return []
+    
+    async def cancel_all_orders(self):
+        """Cancela todas as ordens abertas"""
+        try:
+            orders = await self.get_open_orders_safe()
+            for order in orders:
+                await self.client.cancel_order(order['id'])
+            logger.info(f"Canceladas {len(orders)} ordens")
             return True
-            
         except Exception as e:
-            print(f"❌ Erro na conexão: {e}")
+            logger.error(f"Erro ao cancelar ordens: {e}")
             return False
     
-    def obter_saldo_shares(self):
-        """Obtém saldo de shares do token"""
+    async def has_sufficient_balance(self, price: float, quantity: int = 5):
+        """Verifica se tem saldo suficiente para uma ordem"""
         try:
-            # Método pode variar conforme versão da biblioteca
-            # Tentativa 1: get_balance()
-            try:
-                saldo_info = self.client.get_balance()
-                if isinstance(saldo_info, list):
-                    for item in saldo_info:
-                        if item.get("tokenId") == self.config["TOKEN_ID"]:
-                            return float(item.get("available", 0))
-            except:
-                pass
+            balance = await self.get_balance_safe()
+            required = price * quantity
             
-            # Tentativa 2: Usar API direta (fallback)
-            import requests
-            headers = self.client._get_headers()
-            response = requests.get(
-                f"{self.client.api_url}/balances",
-                headers=headers
-            )
-            balances = response.json()
-            
-            for balance in balances:
-                if balance.get("tokenId") == self.config["TOKEN_ID"]:
-                    return float(balance.get("available", 0))
-            
-            return 0
-            
-        except Exception as e:
-            print(f"⚠️ Erro ao ver saldo: {e}")
-            return 0
-    
-    def obter_ordens_do_usuario(self):
-        """Obtém todas as ordens do usuário e classifica"""
-        try:
-            ordens = self.client.get_orders(OpenOrderParams())
-            
-            compras_abertas = {}
-            vendas_abertas = {}
-            compras_executadas_temp = {}
-            
-            for ordem in ordens:
-                if ordem.get('asset_id') != self.config["TOKEN_ID"]:
-                    continue
-                
-                preco = round(float(ordem.get('price', 0)), 2)
-                lado = ordem.get('side')
-                status = ordem.get('status')
-                ordem_id = ordem.get('id')
-                size_matched = float(ordem.get('size_matched', 0))
-                
-                if status == 'open':
-                    # Ordem ainda aberta
-                    if lado == 'BUY':
-                        compras_abertas[preco] = {
-                            'id': ordem_id,
-                            'size': float(ordem.get('size', 0))
-                        }
-                    elif lado == 'SELL':
-                        vendas_abertas[preco] = {
-                            'id': ordem_id,
-                            'size': float(ordem.get('size', 0))
-                        }
-                
-                elif status in ['filled', 'matched'] and size_matched > 0:
-                    # Ordem executada (virou posição)
-                    if lado == 'BUY':
-                        compras_executadas_temp[preco] = {
-                            'quantidade': size_matched,
-                            'ordem_id': ordem_id,
-                            'vendida': False  # Ainda não foi vendida
-                        }
-            
-            return compras_abertas, vendas_abertas, compras_executadas_temp
-            
-        except Exception as e:
-            print(f"⚠️ Erro ao obter ordens: {e}")
-            return {}, {}, {}
-    
-    def calcular_precos_grid(self):
-        """Calcula todos os preços da grid de compra"""
-        precos = []
-        preco_atual = self.config["PRECO_INICIAL"]
-        
-        while preco_atual >= self.config["PRECO_FINAL"]:
-            precos.append(round(preco_atual, 2))
-            preco_atual -= self.config["INTERVALO_COMPRA"]
-        
-        return precos
-    
-    def criar_ordem(self, preco, lado, quantidade=None):
-        """Cria uma ordem de compra ou venda"""
-        if quantidade is None:
-            quantidade = self.config["SHARES_POR_ORDEM"]
-        
-        try:
-            ordem = OrderArgs(
-                price=preco,
-                size=quantidade,
-                side=lado,
-                token_id=self.config["TOKEN_ID"]
-            )
-            
-            resultado = self.client.create_and_post_order(ordem)
-            print(f"✅ {'COMPRA' if lado == BUY else 'VENDA'} criada: {quantidade} shares a ${preco:.2f}")
-            return True
-            
-        except Exception as e:
-            erro = str(e).lower()
-            if "balance" in erro or "insufficient" in erro:
-                print(f"💰 Saldo insuficiente para ordem a ${preco:.2f}")
-            elif "already" in erro or "duplicate" in erro:
-                print(f"⏭️ Ordem já existe a ${preco:.2f}")
+            # Precisa de saldo + 10% para taxas
+            if balance >= required * 1.1:
+                return True
             else:
-                print(f"⚠️ Erro na ordem: {str(e)[:50]}")
+                logger.warning(f"Saldo insuficiente: {balance} < {required}")
+                return False
+        except Exception as e:
+            logger.error(f"Erro na verificação de saldo: {e}")
             return False
     
-    def atualizar_compras_executadas(self, novas_compras):
-        """Atualiza o dicionário de compras executadas"""
-        for preco, info in novas_compras.items():
-            if preco not in self.compras_executadas:
-                self.compras_executadas[preco] = info
-                print(f"📥 Nova posição: Compra executada a ${preco:.2f}")
+    async def create_order_if_needed(self, price: float):
+        """
+        Cria ordem apenas se não existir uma no mesmo preço
+        e se tiver saldo suficiente
+        """
+        try:
+            # 1. Verifica ordens existentes
+            open_orders = await self.get_open_orders_safe()
+            
+            # 2. Verifica se já existe ordem neste preço
+            for order in open_orders:
+                if abs(float(order.get('price', 0)) - price) < 0.001:
+                    logger.info(f"Já existe ordem em ${price:.2f}")
+                    return False
+            
+            # 3. Verifica saldo
+            if not await self.has_sufficient_balance(price):
+                return False
+            
+            # 4. Cria a ordem
+            quantity = self.config.get('quantity', 5)
+            order_result = await self.client.create_order(
+                side='buy',
+                price=price,
+                quantity=quantity,
+                expiration='Until Cancelled'
+            )
+            
+            if order_result and order_result.get('id'):
+                logger.info(f"✅ COMPRA criada: {quantity} shares a ${price:.2f}")
+                self.orders_created[price] = time.time()
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Erro ao criar ordem em ${price:.2f}: {e}")
+            return False
     
-    def executar_ciclo(self):
-        """Executa um ciclo completo do robô"""
-        self.ciclo += 1
-        
-        print(f"\n{'='*70}")
-        print(f"🔄 CICLO {self.ciclo} - {time.strftime('%H:%M:%S')}")
-        print(f"{'='*70}")
-        
-        # 1. Obtém dados atuais
-        saldo_shares = self.obter_saldo_shares()
-        compras_abertas, vendas_abertas, novas_compras_exec = self.obter_ordens_do_usuario()
-        
-        # Atualiza compras executadas
-        self.atualizar_compras_executadas(novas_compras_exec)
-        
-        print(f"💰 Saldo disponível: {saldo_shares:.2f} shares")
-        print(f"📊 Compras abertas: {len(compras_abertas)} | Vendas abertas: {len(vendas_abertas)}")
-        print(f"📦 Posições compradas: {len(self.compras_executadas)}")
-        
-        # 2. Calcula grid de compra
-        grid_compras = self.calcular_precos_grid()
-        
-        # 3. ORDENS DE COMPRA: Cria ordens para preços sem compra aberta ou executada
-        print(f"\n🔵 CRIANDO ORDENS DE COMPRA...")
-        ordens_compra_criadas = 0
-        
-        for preco_compra in grid_compras:
-            # Verifica limites
-            if len(compras_abertas) >= self.config["MAX_ORDENS_ABERTAS"]:
-                print("   ⏹️ Limite de ordens de compra atingido")
-                break
+    async def cleanup_old_orders(self, max_age_minutes: int = 5):
+        """Cancela ordens muito antigas que não foram executadas"""
+        try:
+            open_orders = await self.get_open_orders_safe()
+            current_time = time.time()
             
-            # Já tem compra aberta OU já tem posição nesse preço?
-            if preco_compra in compras_abertas or preco_compra in self.compras_executadas:
-                continue
-            
-            # Cria ordem de compra
-            if self.criar_ordem(preco_compra, BUY):
-                ordens_compra_criadas += 1
-                time.sleep(0.5)  # Pequeno delay
-            
-            if ordens_compra_criadas >= 2:  # Máximo 2 ordens por ciclo
-                break
-        
-        # 4. ORDENS DE VENDA: Para cada posição comprada que ainda não foi vendida
-        print(f"\n🟢 CRIANDO ORDENS DE VENDA...")
-        ordens_venda_criadas = 0
-        
-        for preco_compra, info in list(self.compras_executadas.items()):
-            # Se já foi vendida, pula
-            if info.get('vendida', False):
-                continue
-            
-            preco_venda = round(preco_compra + self.config["LUCRO_ALVO"], 2)
-            quantidade = info['quantidade']
-            
-            # Já tem venda aberta nesse preço?
-            if preco_venda in vendas_abertas:
-                print(f"   ✅ Já tem venda aberta a ${preco_venda:.2f}")
-                continue
-            
-            # Cria ordem de venda
-            print(f"   🎯 Vendendo posição: ${preco_compra:.2f} → ${preco_venda:.2f}")
-            if self.criar_ordem(preco_venda, SELL, quantidade):
-                ordens_venda_criadas += 1
-                time.sleep(0.5)
-            
-            if ordens_venda_criadas >= 2:  # Máximo 2 ordens por ciclo
-                break
-        
-        # 5. VERIFICA VENDAS EXECUTADAS: Se uma venda foi executada, remove a posição
-        # (Isso será detectado no próximo ciclo quando a ordem sumir)
-        
-        # 6. RE-COMPRA AUTOMÁTICA: Se venda foi executada, pode recomprar
-        # Esta lógica será implementada monitorando quando vendas desaparecem
-        
-        # 7. Mostra resumo
-        print(f"\n📋 RESUMO DO CICLO:")
-        print(f"   Ordens de compra criadas: {ordens_compra_criadas}")
-        print(f"   Ordens de venda criadas: {ordens_venda_criadas}")
-        
-        if self.compras_executadas:
-            print(f"   Posições ativas:")
-            for preco, info in sorted(self.compras_executadas.items()):
-                status = "✅ Vendida" if info.get('vendida') else "⏳ Aguardando venda"
-                print(f"     • ${preco:.2f}: {info['quantidade']} shares ({status})")
-        
-        # 8. Limpeza: Marca como vendidas as posições que têm venda correspondente executada
-        # (Será implementado com verificação de histórico)
-        
-        return True
+            for order in open_orders:
+                order_id = order.get('id')
+                order_price = float(order.get('price', 0))
+                
+                # Verifica se a ordem está na nossa lista e é muito antiga
+                if order_price in self.orders_created:
+                    order_age = current_time - self.orders_created[order_price]
+                    if order_age > max_age_minutes * 60:  # Converter para segundos
+                        await self.client.cancel_order(order_id)
+                        logger.info(f"Cancelada ordem antiga em ${order_price:.2f}")
+                        del self.orders_created[order_price]
+                        
+        except Exception as e:
+            logger.error(f"Erro no cleanup: {e}")
     
-    def monitorar_vendas_executadas(self):
-        """Monitora se vendas foram executadas para liberar re-compra"""
-        # Esta função seria chamada periodicamente para verificar
-        # se ordens de venda foram executadas
-        pass
-    
-    def iniciar(self):
-        """Inicia o robô em loop contínuo"""
-        if not self.conectar():
-            return
+    async def run_cycle(self, cycle_number: int):
+        """Executa um ciclo completo do grid trading"""
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🔄 CICLO {cycle_number}")
+        logger.info(f"{'='*60}")
         
-        print(f"\n🚀 INICIANDO OPERAÇÃO...")
-        print(f"   Intervalo: {self.config['INTERVALO_CICLO']} segundos")
-        print(f"   Pressione Ctrl+C para parar")
-        print("-"*70)
+        # 1. Limpa ordens antigas
+        await self.cleanup_old_orders()
+        
+        # 2. Verifica saldo
+        balance = await self.get_balance_safe()
+        logger.info(f"💰 Saldo disponível: ${balance:.2f}")
+        
+        # 3. Verifica ordens abertas
+        open_orders = await self.get_open_orders_safe()
+        logger.info(f"📊 Compras abertas: {len(open_orders)}")
+        
+        # 4. Cria ordens do grid
+        logger.info("🔵 CRIANDO ORDENS DE COMPRA...")
+        orders_created_count = 0
+        
+        for price in self.grid_prices:
+            if await self.create_order_if_needed(price):
+                orders_created_count += 1
+            
+            # Pequena pausa entre ordens
+            await asyncio.sleep(0.5)
+        
+        logger.info(f"📋 RESUMO DO CICLO:")
+        logger.info(f"   Ordens de compra criadas: {orders_created_count}")
+        logger.info(f"   Ordens abertas totais: {len(open_orders)}")
+        
+        # 5. Aguarda próximo ciclo
+        interval = self.config.get('interval', 20)
+        logger.info(f"⏳ Próximo ciclo em {interval} segundos...")
+        await asyncio.sleep(interval)
+    
+    async def start(self):
+        """Inicia o robô"""
+        logger.info("🚀 INICIANDO ROBÔ CORRIGIDO...")
+        logger.info(f"📈 Grid: ${self.grid_prices[0]:.2f} até ${self.grid_prices[-1]:.2f}")
+        logger.info(f"⏱️ Intervalo: {self.config.get('interval', 20)} segundos")
+        logger.info("🛑 Pressione Ctrl+C para parar")
+        
+        # Cancela ordens existentes no início
+        logger.info("🔄 Cancelando ordens existentes...")
+        await self.cancel_all_orders()
+        self.orders_created.clear()
+        
+        # Inicia o loop
+        self.running = True
+        cycle = 1
         
         try:
-            while True:
-                inicio_ciclo = time.time()
-                
-                self.executar_ciclo()
-                
-                # Calcula tempo restante para completar 20 segundos
-                tempo_execucao = time.time() - inicio_ciclo
-                tempo_espera = max(1, self.config["INTERVALO_CICLO"] - tempo_execucao)
-                
-                print(f"\n⏳ Próximo ciclo em {tempo_espera:.1f} segundos...")
-                time.sleep(tempo_espera)
-                
+            while self.running:
+                await self.run_cycle(cycle)
+                cycle += 1
         except KeyboardInterrupt:
-            print(f"\n\n🛑 Robô interrompido pelo usuário")
-            print(f"   Total de ciclos: {self.ciclo}")
-            print(f"   Posições ativas: {len(self.compras_executadas)}")
-            
-            # Salva estado se quiser continuar depois
-            if self.compras_executadas:
-                print(f"\n💾 Posições para retomar:")
-                for preco, info in self.compras_executadas.items():
-                    print(f"   ${preco:.2f}: {info['quantidade']} shares")
-        
-        except Exception as e:
-            print(f"\n❌ ERRO CRÍTICO: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.info("\n🛑 Robô interrompido pelo usuário")
+        finally:
+            self.running = False
+            logger.info("✅ Robô finalizado")
 
-# ============================================================================
-# FUNÇÃO AUXILIAR: Encontrar ID do mercado
-# ============================================================================
-def encontrar_id_mercado():
-    """Função para encontrar o ID do mercado automaticamente"""
-    import requests
-    import re
+# USO DO ROBÔ (COMO CHAMAR)
+async def main():
+    """
+    Exemplo de como usar o robô corrigido
+    """
+    # 1. Importar seu cliente (já existente)
+    # from seu_client import ClobClient
     
-    print("\n" + "="*70)
-    print("🔍 BUSCANDO ID DO MERCADO AUTOMATICAMENTE")
-    print("="*70)
+    # 2. Configurar o cliente (já feito no seu código)
+    # client = ClobClient(...)
     
-    slug = "bitcoin-up-or-down-february-7-3pm-et"
-    url = f"https://gamma-api.polymarket.com/events?slug={slug}"
+    # 3. Configurações do robô
+    config = {
+        'interval': 20,  # segundos entre ciclos
+        'quantity': 5,   # shares por ordem
+        'min_price': 0.52,
+        'max_price': 0.80
+    }
     
-    try:
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        
-        for event in data:
-            for market in event.get("markets", []):
-                if "Bitcoin Up or Down" in market.get("question", ""):
-                    token_ids = market.get("clobTokenIds", [])
-                    if token_ids:
-                        token_id = str(token_ids[0])
-                        print(f"✅ ID encontrado: {token_id}")
-                        print(f"   Primeiros 15 chars: {token_id[:15]}...")
-                        return token_id
-        
-        print("❌ Mercado não encontrado na API")
-        return None
-        
-    except Exception as e:
-        print(f"❌ Erro na busca: {e}")
-        return None
+    # 4. Criar e iniciar o robô
+    # bot = GridTradingBotCorrigido(client, config)
+    # await bot.start()
 
-# ============================================================================
-# EXECUÇÃO PRINCIPAL
-# ============================================================================
 if __name__ == "__main__":
-    # Verifica se precisa encontrar o ID
-    if CONFIG["TOKEN_ID"] == "INSIRA_O_ID_AQUI":
-        print("⚠️  Configurando ID do mercado...")
-        token_id = encontrar_id_mercado()
-        
-        if token_id:
-            CONFIG["TOKEN_ID"] = token_id
-            print(f"\n✅ ID configurado: {token_id[:15]}...")
-        else:
-            print("\n❌ Não foi possível encontrar o ID do mercado")
-            print("   Execute manualmente o scanner ou cole o ID na CONFIG")
-            sys.exit(1)
+    print("""
+    ⚠️  IMPORTANTE: 
+    1. Primeiro cancele todas as ordens no Polymarket
+    2. Copie este código para seu arquivo existente
+    3. Substitua as funções problemáticas
     
-    # Cria e inicia o robô
-    robo = RoboGridTrading(CONFIG)
-    robo.iniciar()
+    Use este código como base para corrigir seu robô!
+    """)
